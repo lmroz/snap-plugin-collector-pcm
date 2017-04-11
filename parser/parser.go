@@ -28,13 +28,11 @@ import (
 
 	"math"
 
+	"time"
+
 	log "github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 )
-
-// CompatibilityMode when true, parser behaves like old one, it's returning last cached line
-// instead waiting for next one.
-var CompatibilityMode = true
 
 // Specifies how many fields should be ignored before getting useful data
 const ignoreFirstNFields = 2
@@ -59,60 +57,51 @@ type (
 
 func RunParser(reader io.Reader) Parser {
 	p := &pcmParser{
-		source:          reader,
-		keysReady:       make(chan struct{}),
-		keysInfoMutex:   new(sync.RWMutex),
-		streamInfoReady: make(chan struct{}),
-		streamInfoMutex: new(sync.RWMutex),
-	}
-	go p.run()
-	return p
-}
-
-func RunStreamedParser(reader io.Reader, chanLen int) (Parser, <-chan ValuesOrError) {
-	p := &pcmParser{
-		source:        reader,
-		sink:          make(chan ValuesOrError, chanLen),
-		keysReady:     make(chan struct{}),
-		keysInfoMutex: new(sync.RWMutex),
+		source: reader,
+		mutex:  new(sync.RWMutex),
 	}
 	go p.run()
 
-	return p, p.sink
+	sig := make(chan struct{})
+	go func() {
+		for {
+			if p.isReady {
+				close(sig)
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-time.After(time.Second * 2):
+			log.Fatal("timed out starting parser")
+		case <-sig:
+			return p
+		}
+	}
 }
 
 func (p *pcmParser) GetKeys(ctx context.Context) ([]Key, error) {
-	var sig chan struct{}
-	withRLock(p.keysInfoMutex, func() {
-		sig = p.keysReady
+	sig := make(chan struct{})
+	go withRLock(p.mutex, func() {
+		close(sig)
 	})
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-sig:
-			var keys []Key
-			withRLock(p.keysInfoMutex, func() {
-				keys = p.keys
-			})
-			return keys, nil
+			return p.keys, nil
 		}
 	}
 }
 
 func (p *pcmParser) GetValues(ctx context.Context) (Values, error) {
-	if p.sink != nil {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case vals := <-p.sink:
-			return vals.Values, vals.Error
-		}
-	}
-
-	var sig chan struct{}
-	withRLock(p.streamInfoMutex, func() {
-		sig = p.streamInfoReady
+	sig := make(chan struct{})
+	go withRLock(p.mutex, func() {
+		close(sig)
 	})
 
 	for {
@@ -121,8 +110,8 @@ func (p *pcmParser) GetValues(ctx context.Context) (Values, error) {
 			return nil, ctx.Err()
 		case <-sig:
 			var sVal ValuesOrError
-			withRLock(p.streamInfoMutex, func() {
-				sVal = p.stream
+			withRLock(p.mutex, func() {
+				sVal = p.values
 			})
 			return sVal.Values, sVal.Error
 		}
@@ -130,123 +119,91 @@ func (p *pcmParser) GetValues(ctx context.Context) (Values, error) {
 }
 
 type pcmParser struct {
-	source io.Reader
-	sink   chan ValuesOrError
-
-	keys          []Key
-	keysReady     chan struct{}
-	keysInfoMutex *sync.RWMutex
-
-	stream          ValuesOrError
-	streamInfoReady chan struct{}
-	streamInfoMutex *sync.RWMutex
+	source  io.Reader
+	isReady bool
+	keys    []Key
+	values  ValuesOrError
+	mutex   *sync.RWMutex
 }
 
 func (p *pcmParser) run() {
 	scanner := bufio.NewScanner(p.source)
 	var first, second, current []string
-	streamInfoClosed := false
 	line := 0
 	for scanner.Scan() {
-		line++
-		if first == nil {
-			first = splitLine(scanner.Text())
-			const want = ignoreFirstNFields + 1
-			if len(first) < want {
-				log.WithFields(log.Fields{
-					"block":    "header",
-					"line":     line,
-					"function": "run",
-				}).Fatalf("first line should have at least %v columns separated by ';', got: %v", want, len(first))
+		withLock(p.mutex, func() {
+			defer func() { p.isReady = true }()
+			line++
+			if first == nil {
+				first = splitLine(scanner.Text())
+				const want = ignoreFirstNFields + 1
+				if len(first) < want {
+					log.WithFields(log.Fields{
+						"block":    "header",
+						"line":     line,
+						"function": "run",
+					}).Fatalf("first line should have at least %v columns separated by ';', got: %v", want, len(first))
+				}
+				fillHeader(first)
+				return // returns from anonymous function called by withLock
 			}
-			fillHeader(first)
-			continue
-		}
-		if second == nil {
-			second = splitLine(scanner.Text())
-			if len(first) != len(second) {
-				log.WithFields(log.Fields{
-					"block":    "data",
-					"line":     line,
-					"function": "run",
-				},
-				).Fatalf("headers' lines should have equal number of columns: got %v and %v", len(first), len(second))
-			}
+			if second == nil {
+				second = splitLine(scanner.Text())
+				if len(first) != len(second) {
+					log.WithFields(log.Fields{
+						"block":    "data",
+						"line":     line,
+						"function": "run",
+					},
+					).Fatalf("headers' lines should have equal number of columns: got %v and %v", len(first), len(second))
+				}
 
-			first = first[ignoreFirstNFields:]
-			second = second[ignoreFirstNFields:]
+				first = first[ignoreFirstNFields:]
+				second = second[ignoreFirstNFields:]
 
-			withLock(p.keysInfoMutex, func() {
 				p.keys = make([]Key, len(first))
 				for i, topHeader := range first {
 					p.keys[i] = Key{Component: topHeader, MetricName: second[i]}
 				}
-				close(p.keysReady)
-			})
-			continue
-		}
 
-		current = splitLine(scanner.Text())
-		if len(first)+ignoreFirstNFields != len(current) {
-			log.WithFields(log.Fields{
-				"block":    "header",
-				"line":     line,
-				"function": "run",
-			},
-			).Fatalf("headers' and data records should have equal number of columns, got: %v and %v", len(first)+ignoreFirstNFields, len(current))
-		}
-		current = current[ignoreFirstNFields:]
+				return //returns from anonymous function called by withLock
+			}
 
-		vals := ValuesOrError{Values: Values{}}
-		for i, field := range current {
+			current = splitLine(scanner.Text())
+			if len(first)+ignoreFirstNFields != len(current) {
+				log.WithFields(log.Fields{
+					"block":    "header",
+					"line":     line,
+					"function": "run",
+				},
+				).Fatalf("headers' and data records should have equal number of columns, got: %v and %v", len(first)+ignoreFirstNFields, len(current))
+			}
+			current = current[ignoreFirstNFields:]
 
-			k := Key{Component: first[i], MetricName: second[i]}
-			if strings.ToLower(field) == "n/a" {
-				//TODO: make sure this is desired, maybe entry should be just missing
-				vals.Values[k] = math.NaN()
-			} else {
-				if strings.HasSuffix(field, "%") {
-					field = strings.TrimSpace(strings.TrimSuffix(field, "%"))
-				}
-				v, err := strconv.ParseFloat(field, 64)
-				if err == nil {
-					vals.Values[k] = v
+			vals := ValuesOrError{Values: Values{}}
+			for i, field := range current {
+
+				k := Key{Component: first[i], MetricName: second[i]}
+				if strings.ToLower(field) == "n/a" {
+					//TODO: make sure this is desired, maybe entry should be just missing
+					vals.Values[k] = math.NaN()
 				} else {
-					vals = ValuesOrError{Error: errors.Wrapf(err, "parsing %v = %v failed", k, field)}
-					break
+					if strings.HasSuffix(field, "%") {
+						field = strings.TrimSpace(strings.TrimSuffix(field, "%"))
+					}
+					v, err := strconv.ParseFloat(field, 64)
+					if err == nil {
+						vals.Values[k] = v
+					} else {
+						vals = ValuesOrError{Error: errors.Wrapf(err, "parsing %v = %v failed", k, field)}
+						break
+					}
 				}
 			}
-		}
-
-		if p.sink == nil {
-			withLock(p.streamInfoMutex, func() {
-				orgSig := p.streamInfoReady
-				if !CompatibilityMode {
-					p.streamInfoReady = make(chan struct{})
-				}
-				p.stream = vals
-				if !CompatibilityMode || !streamInfoClosed {
-					close(orgSig)
-					streamInfoClosed = true
-				}
-			})
-		} else {
-			p.sink <- vals
-		}
+			p.values = vals
+		})
 	}
-	if p.sink == nil {
-		if !CompatibilityMode {
-			withLock(p.streamInfoMutex, func() {
-				orgSig := p.streamInfoReady
-				p.stream = ValuesOrError{Error: errors.New("stream not running")}
-				close(orgSig)
-				streamInfoClosed = true
 
-			})
-		}
-	} else {
-		close(p.sink)
-	}
 }
 
 func fillHeader(headerRef []string) {
