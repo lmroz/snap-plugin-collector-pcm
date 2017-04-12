@@ -180,12 +180,12 @@ func (pcm *PCM) run() error {
 		return fmt.Errorf("Error creating StdoutPipe %v", err)
 	}
 
-	pcm.parser = parser.RunParser(cmdReader)
-
 	err = cmd.Start()
 	if err != nil {
 		return fmt.Errorf("Error starting pcm %v", err)
 	}
+
+	pcm.parser = parser.RunParser(cmdReader)
 
 	// LEAVE the following block for debugging
 	// err = cmd.Wait()
